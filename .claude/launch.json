@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Pace Car Mayhem (static HTTP server)",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "3000", "--directory", "/Users/alex.prizov/github.com/prizov/pace-car"],
+      "port": 3000
+    }
+  ]
+}
