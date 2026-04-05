@@ -23,6 +23,11 @@ import {
   GIGACAT_POUNCE_DURATION,
   GIGACAT_POUNCE_RADIUS,
   GIGACAT_POUNCE_COOLDOWN,
+  SEAL_SPEED,
+  SEAL_FART_RADIUS,
+  SEAL_FART_DURATION,
+  SEAL_FART_COOLDOWN,
+  SEAL_FART_SLOW_MULT,
 } from '../constants.js';
 import {
   TEAMS,
@@ -35,11 +40,21 @@ import {
 import { AudioEngine } from '../audio/AudioEngine.js';
 import { mmX, mmY } from '../render/textures.js';
 
+const AI_TRACK_HALF_WIDTH = 60;
+const AI_LANE_MARGIN = 18;
+const AI_MAX_LANE_OFFSET = AI_TRACK_HALF_WIDTH - AI_LANE_MARGIN;
+const AI_OVERTAKE_STRAIGHTNESS_MIN = 0.93;
+const TRACK_SEGMENT_AVG = WAYPOINTS.reduce((total, wp, index) => {
+  const next = WAYPOINTS[(index + 1) % WP_COUNT];
+  return total + Math.hypot(next.x - wp.x, next.y - wp.y);
+}, 0) / WP_COUNT;
+
 export class GameScene extends Phaser.Scene {
   constructor() { super({ key:'GameScene' }); }
 
   init() {
     this.devFlags = window.__PACE_CAR_DEV__ || {};
+    this.isTouchDevice = window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
     this.score = 0;
     this.carsRemaining = 22;
     this.lastDestroyTime = 0;
@@ -62,6 +77,19 @@ export class GameScene extends Phaser.Scene {
     this.gigaCatPouncing = false;
     this.gigaCatPounceTimer = 0;
     this.gigaCatPounceCooldown = 0;
+    this.isSeal = false;
+    this.sealFartCooldown = 0;
+    this.sealClouds = [];
+    this.touchControls = {
+      up: false,
+      down: false,
+      left: false,
+      right: false,
+    };
+    this.touchActionLocks = {
+      ability: false,
+      transform: false,
+    };
   }
 
   create() {
@@ -92,11 +120,12 @@ export class GameScene extends Phaser.Scene {
     // ── F1 Cars ──
     this.f1Cars = [];
     this.f1CarSprites = this.physics.add.group();
+    const startingGrid = Phaser.Utils.Array.Shuffle([...DRIVERS]);
 
     // Grid: 2-wide formation on S/F straight.
     // S/F runs east (+x) at y≈280. Race direction = increasing x.
     // Pole (P1) at x≈1880 (closest to T01). P22 at x≈1330. Player at x≈1230.
-    DRIVERS.forEach((driver, i) => {
+    startingGrid.forEach((driver, i) => {
       const row = Math.floor(i / 2);
       const col = i % 2; // 0=left lane (slightly north), 1=right lane (slightly south)
       const gridX = 1880 - row * 50;
@@ -110,8 +139,9 @@ export class GameScene extends Phaser.Scene {
       const sprite = this.physics.add.sprite(gridX, gridY, key);
       sprite.setDepth(9);
       sprite.setAngle(90); // all cars face east at start
-      sprite.body.setSize(14, 28);
+      sprite.body.setSize(18, 34);
       sprite.body.setMaxVelocity(AI_MAX_SPEED, AI_MAX_SPEED);
+      sprite.setBounce(0);
 
       // Determine initial state
       let hp = 100;
@@ -120,7 +150,7 @@ export class GameScene extends Phaser.Scene {
 
       if (driver.special === 'stroll') { hp = 67; state = 1; speedMult = 0.6; }
       if (driver.special === 'alonso') hp = 130; // 4-hit car
-      if (driver.team === 'astonmartin') speedMult *= 0.7;
+      const startProgress = this.findClosestTrackProgress(gridX, gridY);
 
       const car = {
         sprite, driver, key,
@@ -133,6 +163,18 @@ export class GameScene extends Phaser.Scene {
         shakeTimer: 0,
         aggroTimer: 0, // verstappen
         swerveAngle: 0,
+        lastImpactTime: 0,
+        aiLaneOffset: 0,
+        aiLaneTarget: 0,
+        aiOvertakeSide: Phaser.Math.Between(0, 1) === 0 ? -1 : 1,
+        aiHeading: 90,
+        aiCruiseScale: Phaser.Math.FloatBetween(0.985, 1.015),
+        aiLookAhead: Phaser.Math.Between(1, 2),
+        aiTurnResponsiveness: Phaser.Math.FloatBetween(0.94, 1.02),
+        aiTrafficState: 'follow',
+        aiTrafficCooldown: Phaser.Math.Between(0, 300),
+        aiSpeed: AI_MAX_SPEED * speedMult * 0.72,
+        pathProgress: startProgress,
       };
 
       // Smoke for Aston Martin from start
@@ -147,11 +189,11 @@ export class GameScene extends Phaser.Scene {
 
 
     // ── Collisions: player ↔ F1 cars ──
-    this.physics.add.overlap(
+    this.physics.add.collider(
       this.player,
       this.f1CarSprites,
       this.handleCollision,
-      null,
+      this.shouldPlayerPhysicallyCollideWithCar,
       this
     );
 
@@ -181,6 +223,7 @@ export class GameScene extends Phaser.Scene {
 
     // ── Input ──
     this.cursors = this.input.keyboard.createCursorKeys();
+    this.input.addPointer(4);
     this.wasd = this.input.keyboard.addKeys({
       up: Phaser.Input.Keyboard.KeyCodes.W,
       down: Phaser.Input.Keyboard.KeyCodes.S,
@@ -201,6 +244,9 @@ export class GameScene extends Phaser.Scene {
 
     // ── HUD (fixed camera) ──
     this.createHUD();
+    if (this.isTouchDevice) {
+      this.createTouchControls();
+    }
 
     // ── Minimap ──
     this.createMinimap();
@@ -449,45 +495,167 @@ export class GameScene extends Phaser.Scene {
 
   // ── HUD ──
   createHUD() {
-    const cam = this.cameras.main;
+    const hudScale = this.isTouchDevice ? 1.45 : 1;
+    const modeFont = this.isTouchDevice ? 18 : 12;
+    const scoreFont = this.isTouchDevice ? 30 : 20;
+    const carsFont = this.isTouchDevice ? 24 : 16;
+    const speedFont = this.isTouchDevice ? 22 : 14;
+    const barTitleFont = this.isTouchDevice ? 18 : 11;
+    const barLabelFont = this.isTouchDevice ? 16 : 10;
+    const rightInset = this.isTouchDevice ? 22 : 16;
+    const topInset = this.isTouchDevice ? 24 : 16;
+    const modeY = this.isTouchDevice ? 170 : 136;
+    const barWidth = this.isTouchDevice ? 172 : 120;
+    const barY = this.isTouchDevice ? 146 : 108;
+    const barLabelY = this.isTouchDevice ? 158 : 115;
 
     // Mode indicator (below minimap on left side)
-    this.modeText = this.add.text(16, 136, '🚗 CAR  [T=TRANSFORM | SPC=TURBO]', {
-      fontSize:'12px', fontFamily:'monospace', color:'#AAFFAA',
+    this.modeText = this.add.text(16, modeY, this.isTouchDevice ? 'CAR  |  FORM / ACT' : '🚗 CAR  [T=TRANSFORM | SPC=TURBO]', {
+      fontSize:`${modeFont}px`, fontFamily:'monospace', color:'#AAFFAA',
       stroke:'#000', strokeThickness:3,
     }).setScrollFactor(0).setDepth(90);
 
-    this.scoreText = this.add.text(W - 16, 16, 'SCORE: 0', {
-      fontSize:'20px', fontFamily:'monospace', color:'#FFFFFF',
+    this.scoreText = this.add.text(W - rightInset, topInset, 'SCORE: 0', {
+      fontSize:`${scoreFont}px`, fontFamily:'monospace', color:'#FFFFFF',
       stroke:'#000', strokeThickness:4,
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(90);
 
-    this.carsText = this.add.text(W - 16, 44, 'CARS: 22 / 22', {
-      fontSize:'16px', fontFamily:'monospace', color:'#AAFFAA',
+    this.carsText = this.add.text(W - rightInset, topInset + (this.isTouchDevice ? 36 : 28), 'CARS: 22 / 22', {
+      fontSize:`${carsFont}px`, fontFamily:'monospace', color:'#AAFFAA',
       stroke:'#000', strokeThickness:3,
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(90);
 
-    this.speedText = this.add.text(W - 16, 68, '', {
-      fontSize:'14px', fontFamily:'monospace', color:'#FFAAAA',
+    this.speedText = this.add.text(W - rightInset, topInset + (this.isTouchDevice ? 72 : 52), '', {
+      fontSize:`${speedFont}px`, fontFamily:'monospace', color:'#FFAAAA',
       stroke:'#000', strokeThickness:3,
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(90);
 
     // Turbo/Missile bar title
-    this.turboBarTitle = this.add.text(W - 16, 92, 'TURBO', {
-      fontSize:'11px', fontFamily:'monospace', color:'#AAAAAA',
+    this.turboBarTitle = this.add.text(W - rightInset, topInset + (this.isTouchDevice ? 104 : 76), 'TURBO', {
+      fontSize:`${barTitleFont}px`, fontFamily:'monospace', color:'#AAAAAA',
       stroke:'#000', strokeThickness:2,
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(90);
 
     // Bar background
-    this.add.rectangle(W - 16 - 60, 108, 120, 10, 0x333333)
+    this.add.rectangle(W - rightInset - barWidth, barY, barWidth, this.isTouchDevice ? 14 : 10, 0x333333)
       .setOrigin(0, 0.5).setScrollFactor(0).setDepth(90);
     // Bar fill (drawn as a rectangle we resize each frame)
-    this.turboBarFill = this.add.rectangle(W - 16 - 60, 108, 120, 10, 0x00FFFF)
+    this.turboBarFill = this.add.rectangle(W - rightInset - barWidth, barY, barWidth, this.isTouchDevice ? 14 : 10, 0x00FFFF)
       .setOrigin(0, 0.5).setScrollFactor(0).setDepth(91);
-    this.turboBarLabel = this.add.text(W - 16, 115, 'READY', {
-      fontSize:'10px', fontFamily:'monospace', color:'#00FFFF',
+    this.turboBarLabel = this.add.text(W - rightInset, barLabelY, 'READY', {
+      fontSize:`${barLabelFont}px`, fontFamily:'monospace', color:'#00FFFF',
       stroke:'#000', strokeThickness:2,
     }).setOrigin(1, 0.5).setScrollFactor(0).setDepth(92);
+  }
+
+  createTouchControls() {
+    const bottomY = H - 142;
+    const leftX = 132;
+    const rightX = W - 124;
+    this.touchUi = this.add.container(0, 0).setScrollFactor(0).setDepth(120);
+
+    const makeHoldButton = ({ x, y, label, control, size = 68 }) => {
+      const bg = this.add.circle(x, y, size, 0x0d1b1a, 0.6)
+        .setStrokeStyle(3, 0xb7ffea, 0.28)
+        .setScrollFactor(0)
+        .setDepth(121)
+        .setInteractive({ useHandCursor: false });
+      const text = this.add.text(x, y, label, {
+        fontSize: '30px',
+        fontFamily: 'monospace',
+        color: '#EFFFFA',
+        stroke: '#000',
+        strokeThickness: 4,
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(122);
+      const activePointers = new Set();
+      const syncVisual = () => {
+        const pressed = activePointers.size > 0;
+        this.touchControls[control] = pressed;
+        bg.setFillStyle(pressed ? 0x27c4a8 : 0x0d1b1a, pressed ? 0.9 : 0.6);
+        bg.setScale(pressed ? 0.94 : 1);
+      };
+      const releasePointer = (pointer) => {
+        activePointers.delete(pointer.id);
+        syncVisual();
+      };
+      bg.on('pointerdown', (pointer) => {
+        activePointers.add(pointer.id);
+        syncVisual();
+      });
+      bg.on('pointerup', releasePointer);
+      bg.on('pointerout', releasePointer);
+      bg.on('pointerupoutside', releasePointer);
+      this.input.on('pointerup', releasePointer);
+      this.touchUi.add([bg, text]);
+    };
+
+    const makeTapButton = ({ x, y, label, accent, key, onTap, radius = 54 }) => {
+      const bg = this.add.circle(x, y, radius, accent, 0.82)
+        .setStrokeStyle(3, 0xffffff, 0.22)
+        .setScrollFactor(0)
+        .setDepth(121)
+        .setInteractive({ useHandCursor: false });
+      const text = this.add.text(x, y, label, {
+        fontSize: '18px',
+        fontFamily: 'monospace',
+        color: '#FFFFFF',
+        stroke: '#000',
+        strokeThickness: 4,
+        align: 'center',
+      }).setOrigin(0.5).setScrollFactor(0).setDepth(122);
+      const releaseTap = () => {
+        this.touchActionLocks[key] = false;
+        bg.setScale(1);
+      };
+      bg.on('pointerdown', () => {
+        if (this.touchActionLocks[key]) return;
+        this.touchActionLocks[key] = true;
+        bg.setScale(0.94);
+        onTap();
+      });
+      bg.on('pointerup', releaseTap);
+      bg.on('pointerout', releaseTap);
+      bg.on('pointerupoutside', releaseTap);
+      this.input.on('pointerup', releaseTap);
+      this.touchUi.add([bg, text]);
+    };
+
+    makeHoldButton({ x: leftX, y: bottomY - 78, label: '↑', control: 'up' });
+    makeHoldButton({ x: leftX - 78, y: bottomY + 6, label: '←', control: 'left' });
+    makeHoldButton({ x: leftX, y: bottomY + 6, label: '↓', control: 'down' });
+    makeHoldButton({ x: leftX + 78, y: bottomY + 6, label: '→', control: 'right' });
+
+    makeTapButton({
+      x: rightX,
+      y: bottomY - 30,
+      label: 'ACT',
+      accent: 0xff6a00,
+      key: 'ability',
+      onTap: () => this.activatePrimaryAbility(),
+      radius: 58,
+    });
+    makeTapButton({
+      x: rightX - 106,
+      y: bottomY + 46,
+      label: 'FORM',
+      accent: 0x00a86b,
+      key: 'transform',
+      onTap: () => this.transformToggle(),
+      radius: 50,
+    });
+
+    const hint = this.add.text(rightX - 18, H - 30, 'touch controls', {
+      fontSize: '13px',
+      fontFamily: 'monospace',
+      color: '#D9FFF3',
+      stroke: '#000',
+      strokeThickness: 3,
+    }).setOrigin(1, 1).setScrollFactor(0).setDepth(121).setAlpha(0.7);
+    this.touchUi.add(hint);
+  }
+
+  setModeDisplay(desktopText, mobileText, color) {
+    this.modeText.setText(this.isTouchDevice ? mobileText : desktopText).setColor(color);
   }
 
   createDebugOverlay() {
@@ -502,30 +670,30 @@ export class GameScene extends Phaser.Scene {
   // ── Minimap ──
   createMinimap() {
     const MX = 10, MY = 10;
-    const S = 0.05;
+    this.minimapScale = this.isTouchDevice ? 1.3 : 1;
 
     this.minimapBg = this.add.image(MX, MY, 'minimap_bg')
-      .setOrigin(0, 0).setScrollFactor(0).setDepth(90).setAlpha(0.9);
+      .setOrigin(0, 0).setScrollFactor(0).setDepth(90).setAlpha(0.9).setScale(this.minimapScale);
 
     // Player dot (white)
     this.minimapPlayer = this.add.image(MX, MY, 'dot')
-      .setScrollFactor(0).setDepth(91).setTint(0xFFFFFF).setScale(0.8);
+      .setScrollFactor(0).setDepth(91).setTint(0xFFFFFF).setScale(this.isTouchDevice ? 1.1 : 0.8);
 
     // Car dots
     this.minimapDots = this.f1Cars.map(car => {
       const dot = this.add.image(MX, MY, 'dot')
-        .setScrollFactor(0).setDepth(91).setTint(TEAMS[car.driver.team].body).setScale(0.6);
+        .setScrollFactor(0).setDepth(91).setTint(TEAMS[car.driver.team].body).setScale(this.isTouchDevice ? 0.88 : 0.6);
       return dot;
     });
   }
 
   updateMinimap() {
     const MX = 10, MY = 10;
-    this.minimapPlayer.setPosition(MX + mmX(this.player.x) - 4, MY + mmY(this.player.y) - 4);
+    this.minimapPlayer.setPosition(MX + mmX(this.player.x) * this.minimapScale - 4, MY + mmY(this.player.y) * this.minimapScale - 4);
     this.f1Cars.forEach((car, i) => {
       const dot = this.minimapDots[i];
       if (car.dead) { dot.setVisible(false); return; }
-      dot.setPosition(MX + mmX(car.sprite.x) - 3, MY + mmY(car.sprite.y) - 3);
+      dot.setPosition(MX + mmX(car.sprite.x) * this.minimapScale - 3, MY + mmY(car.sprite.y) * this.minimapScale - 3);
     });
   }
 
@@ -543,22 +711,43 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
-    const playerSpeed = Math.hypot(player.body.velocity.x, player.body.velocity.y);
-    const normSpeed = playerSpeed / PLAYER_MAX_SPEED;
-    if (normSpeed < 0.15) return; // too slow to matter
+    // Seal body-slam — physical contact is enough to wreck the target.
+    if (this.isSeal) {
+      car.hp = 0; car.state = 3;
+      this.destroyCar(car, true);
+      this.cameras.main.shake(100, 0.01);
+      return;
+    }
 
-    // Angle factor: head-on vs glancing
-    const playerAngleRad = Phaser.Math.DegToRad(player.angle - 90);
+    const playerSpeed = Math.hypot(player.body.velocity.x, player.body.velocity.y);
+    const carSpeed = Math.hypot(carSprite.body.velocity.x, carSprite.body.velocity.y);
+    const relVelX = player.body.velocity.x - carSprite.body.velocity.x;
+    const relVelY = player.body.velocity.y - carSprite.body.velocity.y;
+    const relativeSpeed = Math.hypot(relVelX, relVelY);
+    const impactSpeed = Math.max(playerSpeed, relativeSpeed * 0.7);
+    const normSpeed = impactSpeed / PLAYER_MAX_SPEED;
+    const playerNormSpeed = playerSpeed / PLAYER_MAX_SPEED;
+    if (normSpeed < 0.08) return; // too slow to matter
+
+    const now = this.time.now;
+    if (now - car.lastImpactTime < 450) return;
+    car.lastImpactTime = now;
+
+    // Angle factor: head-on vs glancing, based on relative closing vector.
     const toCarX = carSprite.x - player.x;
     const toCarY = carSprite.y - player.y;
     const dist = Math.hypot(toCarX, toCarY) || 1;
-    const dot = (Math.cos(playerAngleRad) * toCarX/dist + Math.sin(playerAngleRad) * toCarY/dist);
+    const closingX = relativeSpeed > 1 ? relVelX / relativeSpeed : (playerSpeed > 1 ? player.body.velocity.x / playerSpeed : 0);
+    const closingY = relativeSpeed > 1 ? relVelY / relativeSpeed : (playerSpeed > 1 ? player.body.velocity.y / playerSpeed : 0);
+    const dot = (closingX * toCarX / dist) + (closingY * toCarY / dist);
     const angleFactor = Math.max(0.3, Math.abs(dot));
 
     const damage = normSpeed * angleFactor * BASE_DAMAGE * 3;
     car.hp -= damage;
 
     const isHighSpeed = normSpeed > 0.8;
+    const isBaseCar = !this.isJet && !this.isGigarocket && !this.isTank && !this.isGigaCat && !this.isSeal;
+    const isLethalRam = isBaseCar && playerNormSpeed > 0.24 && normSpeed > 0.28 && angleFactor > 0.45;
     this.audio.playHit(isHighSpeed);
 
     // Update state
@@ -572,7 +761,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Instant kill on very high-speed direct hit while critical
-    if (car.state === 3 || (isHighSpeed && normSpeed > 0.95 && car.state === 2)) {
+    if (car.state === 3 || isLethalRam || (isHighSpeed && normSpeed > 0.95 && car.state === 2)) {
       car.state = 3;
       car.hp = 0;
     }
@@ -603,10 +792,46 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Bounce player back a bit
-    const pushX = -Math.cos(playerAngleRad) * normSpeed * 150;
-    const pushY = -Math.sin(playerAngleRad) * normSpeed * 150;
+    const pushX = -(relVelX / relativeSpeed) * normSpeed * 150;
+    const pushY = -(relVelY / relativeSpeed) * normSpeed * 150;
     player.body.velocity.x += pushX;
     player.body.velocity.y += pushY;
+  }
+
+  handleAICarContact(spriteA, spriteB) {
+    const carA = spriteA._carData;
+    const carB = spriteB._carData;
+    if (!carA || !carB || carA.dead || carB.dead) return;
+
+    carA.aiTrafficState = 'follow';
+    carB.aiTrafficState = 'follow';
+    carA.aiLaneTarget = 0;
+    carB.aiLaneTarget = 0;
+
+    spriteA.body.velocity.x *= 0.85;
+    spriteA.body.velocity.y *= 0.85;
+    spriteB.body.velocity.x *= 0.85;
+    spriteB.body.velocity.y *= 0.85;
+  }
+
+  shouldPlayerPhysicallyCollideWithCar(player, carSprite) {
+    const car = carSprite?._carData;
+    if (!car || car.dead) return false;
+    return !this.isJet && !this.isGigarocket && !this.gigarocketCharging;
+  }
+
+  checkPlayerCarImpacts() {
+    if (this.preRace || !this.player?.body?.enable) return;
+
+    const playerRadius = Math.max(this.player.displayWidth, this.player.displayHeight) * 0.35;
+    this.f1Cars.forEach(car => {
+      if (car.dead || !car.sprite?.body?.enable) return;
+      const carRadius = Math.max(car.sprite.displayWidth, car.sprite.displayHeight) * 0.32;
+      const dist = Math.hypot(car.sprite.x - this.player.x, car.sprite.y - this.player.y);
+      if (dist <= playerRadius + carRadius) {
+        this.handleCollision(this.player, car.sprite);
+      }
+    });
   }
 
   // ── Destroy car ──
@@ -823,6 +1048,7 @@ export class GameScene extends Phaser.Scene {
 
   getModeName() {
     if (this.gigaCatPouncing || this.isGigaCat) return 'gigacat';
+    if (this.isSeal) return 'seal';
     if (this.gigarocketCharging || this.isGigarocket) return 'gigarocket';
     if (this.isTank) return 'tank';
     if (this.isJet) return 'jet';
@@ -830,6 +1056,13 @@ export class GameScene extends Phaser.Scene {
   }
 
   getDebugState() {
+    if (!this.player?.body) {
+      return {
+        ready: false,
+        scene: this.scene.key,
+      };
+    }
+
     const speed = Math.round(Math.hypot(this.player.body.velocity.x, this.player.body.velocity.y));
     return {
       ready: true,
@@ -845,6 +1078,9 @@ export class GameScene extends Phaser.Scene {
       tankShellCooldown: this.tankShellCooldown,
       gigarocketCharging: this.gigarocketCharging,
       gigaCatPouncing: this.gigaCatPouncing,
+      sealFartCooldown: this.sealFartCooldown,
+      sealClouds: this.sealClouds.length,
+      playerSlowed: this.getSealSlowMultiplier(this.player) < 1,
       player: {
         x: Math.round(this.player.x),
         y: Math.round(this.player.y),
@@ -869,8 +1105,316 @@ export class GameScene extends Phaser.Scene {
       `shellCd: ${Math.ceil(state.tankShellCooldown)}`,
       `rocket: ${state.gigarocketCharging ? 'burning' : 'idle'}`,
       `cat: ${state.gigaCatPouncing ? 'pouncing' : 'grounded'}`,
+      `sealCd: ${Math.ceil(state.sealFartCooldown)}`,
+      `gas: ${state.sealClouds}`,
+      `slowed: ${state.playerSlowed ? 'yes' : 'no'}`,
       `target: ${state.targetedCar ?? '-'}`,
     ]);
+  }
+
+  getAIObstacleCandidates(car, includePlayer = true) {
+    const obstacles = [];
+    const playerIsAirborne = this.isJet || this.isGigarocket || this.gigarocketCharging;
+
+    if (includePlayer && !playerIsAirborne && this.player?.body?.enable) {
+      obstacles.push({
+        source: this.player,
+        x: this.player.x,
+        y: this.player.y,
+        radius: Math.max(this.player.displayWidth, this.player.displayHeight) * 0.6 + 18,
+      });
+    }
+
+    return obstacles;
+  }
+
+  findAIBlockingObstacle(car, targetAngle, options = {}) {
+    const {
+      includePlayer = true,
+      lookAhead = 260,
+      laneHalfWidth = 42,
+      ignoreSource = null,
+    } = options;
+    const sprite = car.sprite;
+    const fx = Math.cos(targetAngle);
+    const fy = Math.sin(targetAngle);
+    const rx = -fy;
+    const ry = fx;
+    let best = null;
+
+    this.getAIObstacleCandidates(car, includePlayer).forEach(obstacle => {
+      if (obstacle.source === ignoreSource) return;
+
+      const dx = obstacle.x - sprite.x;
+      const dy = obstacle.y - sprite.y;
+      const forwardDist = dx * fx + dy * fy;
+      if (forwardDist <= 0 || forwardDist > lookAhead) return;
+
+      const lateralDist = dx * rx + dy * ry;
+      const corridor = laneHalfWidth + obstacle.radius;
+      if (Math.abs(lateralDist) > corridor) return;
+
+      if (!best || forwardDist < best.forwardDist) {
+        best = {
+          ...obstacle,
+          forwardDist,
+          lateralDist,
+        };
+      }
+    });
+
+    return best;
+  }
+
+  getAIAvoidance(car, targetAngle, options = {}) {
+    const {
+      includePlayer = true,
+      lookAhead = 260,
+      laneHalfWidth = 42,
+    } = options;
+    const obstacle = this.findAIBlockingObstacle(car, targetAngle, {
+      includePlayer,
+      lookAhead,
+      laneHalfWidth,
+    });
+
+    if (!obstacle) return { turn: 0, speedMult: 1 };
+
+    const proximity = Phaser.Math.Clamp(1 - (obstacle.forwardDist / lookAhead), 0, 1);
+    let steerDirection = 0;
+
+    if (Math.abs(obstacle.lateralDist) > 10) {
+      steerDirection = obstacle.lateralDist > 0 ? -1 : 1;
+    } else {
+      const leftPressure = this.findAIBlockingObstacle(car, targetAngle - 0.55, {
+        includePlayer,
+        lookAhead,
+        laneHalfWidth,
+        ignoreSource: obstacle.source,
+      });
+      const rightPressure = this.findAIBlockingObstacle(car, targetAngle + 0.55, {
+        includePlayer,
+        lookAhead,
+        laneHalfWidth,
+        ignoreSource: obstacle.source,
+      });
+      steerDirection = (!leftPressure || (rightPressure && leftPressure.forwardDist > rightPressure.forwardDist)) ? -1 : 1;
+    }
+
+    const turn = Phaser.Math.DegToRad(55) * proximity * steerDirection;
+    const speedMult = obstacle.forwardDist < 88
+      ? 0
+      : Phaser.Math.Clamp((obstacle.forwardDist - 88) / (lookAhead - 88), 0.05, 1);
+
+    return { turn, speedMult };
+  }
+
+  findAITrafficBlocker(car, targetAngle, options = {}) {
+    const {
+      lookAhead = 120,
+      laneHalfWidth = 18,
+      laneCenterOffset = 0,
+      ignoreSource = null,
+    } = options;
+    const sprite = car.sprite;
+    const fx = Math.cos(targetAngle);
+    const fy = Math.sin(targetAngle);
+    const rx = -fy;
+    const ry = fx;
+    let best = null;
+
+    this.f1Cars.forEach(other => {
+      if (other === car || other.dead || !other.sprite?.body?.enable || other.sprite === ignoreSource) return;
+
+      const dx = other.sprite.x - sprite.x;
+      const dy = other.sprite.y - sprite.y;
+      const forwardDist = dx * fx + dy * fy;
+      if (forwardDist <= 0 || forwardDist > lookAhead) return;
+
+      const lateralDist = dx * rx + dy * ry;
+      const corridor = laneHalfWidth + Math.max(other.sprite.displayWidth, other.sprite.displayHeight) * 0.18;
+      if (Math.abs(lateralDist - laneCenterOffset) > corridor) return;
+
+      if (!best || forwardDist < best.forwardDist) {
+        best = {
+          source: other.sprite,
+          forwardDist,
+          lateralDist,
+        };
+      }
+    });
+
+    return best;
+  }
+
+  getAITrafficControl(car, targetAngle, delta, baseSpeed, options = {}) {
+    const {
+      lookAhead = 130,
+      laneHalfWidth = 20,
+      allowOvertake = true,
+    } = options;
+    const blocker = this.findAITrafficBlocker(car, targetAngle, {
+      lookAhead,
+      laneHalfWidth,
+    });
+
+    car.aiTrafficCooldown = Math.max(0, car.aiTrafficCooldown - delta);
+
+    const selfSpeed = Math.hypot(car.sprite.body.velocity.x, car.sprite.body.velocity.y);
+    const desiredGap = Phaser.Math.Clamp(64 + selfSpeed * 0.1, 64, 132);
+    const blockerSpeed = blocker
+      ? Math.hypot(blocker.source.body?.velocity?.x ?? 0, blocker.source.body?.velocity?.y ?? 0)
+      : 0;
+
+    car.aiTrafficState = 'follow';
+    car.aiLaneTarget = 0;
+
+    if (!blocker) {
+      return {
+        speedMult: 1,
+        laneTarget: 0,
+      };
+    }
+
+    const gapMult = blocker.forwardDist <= desiredGap
+      ? 0
+      : Phaser.Math.Clamp((blocker.forwardDist - desiredGap) / Math.max(lookAhead - desiredGap, 20), 0.18, 1);
+    const paceMult = blockerSpeed > 10
+      ? Phaser.Math.Clamp((blockerSpeed + 12) / Math.max(baseSpeed, 120), 0.12, 1)
+      : 0.08;
+
+    return {
+      speedMult: Math.min(gapMult, paceMult),
+      laneTarget: 0,
+    };
+  }
+
+  getAITrafficSeparation(car) {
+    const sprite = car.sprite;
+    let pushX = 0;
+    let pushY = 0;
+
+    this.f1Cars.forEach(other => {
+      if (other === car || other.dead || !other.sprite?.body?.enable) return;
+
+      const dx = sprite.x - other.sprite.x;
+      const dy = sprite.y - other.sprite.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      if (dist > 32) return;
+
+      const strength = (32 - dist) / 32;
+      pushX += (dx / dist) * strength * 55;
+      pushY += (dy / dist) * strength * 55;
+    });
+
+    return { x: pushX, y: pushY };
+  }
+
+  applyAIMotion(car, targetVelocityX, targetVelocityY, delta) {
+    const sprite = car.sprite;
+    const body = sprite.body;
+    const blend = Phaser.Math.Clamp((delta / 260) * car.aiTurnResponsiveness, 0.06, 0.18);
+    body.velocity.x = Phaser.Math.Linear(body.velocity.x, targetVelocityX, blend);
+    body.velocity.y = Phaser.Math.Linear(body.velocity.y, targetVelocityY, blend);
+
+    const speed = Math.hypot(body.velocity.x, body.velocity.y);
+    if (speed > 4) {
+      const targetHeading = Phaser.Math.RadToDeg(Math.atan2(body.velocity.y, body.velocity.x)) + 90;
+      const turnBlend = Phaser.Math.Clamp((delta / 240) * car.aiTurnResponsiveness, 0.06, 0.2);
+      const deltaHeading = Phaser.Math.Angle.ShortestBetween(car.aiHeading, targetHeading);
+      car.aiHeading += deltaHeading * turnBlend;
+      sprite.setAngle(car.aiHeading);
+    }
+  }
+
+  findClosestWaypointIndex(x, y) {
+    let best = 0;
+    let bestDist = Infinity;
+
+    WAYPOINTS.forEach((wp, index) => {
+      const dist = Math.hypot(wp.x - x, wp.y - y);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = index;
+      }
+    });
+
+    return best;
+  }
+
+  findClosestTrackProgress(x, y) {
+    let bestProgress = 0;
+    let bestDist = Infinity;
+
+    for (let i = 0; i < WP_COUNT; i += 1) {
+      const wp = WAYPOINTS[i];
+      const wpNext = WAYPOINTS[(i + 1) % WP_COUNT];
+      const segX = wpNext.x - wp.x;
+      const segY = wpNext.y - wp.y;
+      const segLenSq = segX * segX + segY * segY || 1;
+      const pointX = x - wp.x;
+      const pointY = y - wp.y;
+      const t = Phaser.Math.Clamp((pointX * segX + pointY * segY) / segLenSq, 0, 1);
+      const projX = wp.x + segX * t;
+      const projY = wp.y + segY * t;
+      const dist = Math.hypot(x - projX, y - projY);
+
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestProgress = i + t;
+      }
+    }
+
+    return Phaser.Math.Wrap(bestProgress, 0, WP_COUNT);
+  }
+
+  sampleTrackPoint(progress) {
+    const wrapped = Phaser.Math.Wrap(progress, 0, WP_COUNT);
+    const base = Math.floor(wrapped);
+    const next = (base + 1) % WP_COUNT;
+    const t = wrapped - base;
+    const wp = WAYPOINTS[base];
+    const wpNext = WAYPOINTS[next];
+    const x = Phaser.Math.Linear(wp.x, wpNext.x, t);
+    const y = Phaser.Math.Linear(wp.y, wpNext.y, t);
+    const s = Phaser.Math.Linear(wp.s, wpNext.s, t);
+    const angle = Math.atan2(wpNext.y - wp.y, wpNext.x - wp.x);
+
+    return { x, y, s, angle };
+  }
+
+  getProgressGap(behindProgress, aheadProgress) {
+    let gap = aheadProgress - behindProgress;
+    if (gap <= 0) gap += WP_COUNT;
+    return gap;
+  }
+
+  findLeadCar(car) {
+    let bestLead = null;
+    let bestGap = WP_COUNT + 1;
+
+    this.f1Cars.forEach(other => {
+      if (other === car || other.dead) return;
+      const gap = this.getProgressGap(car.pathProgress, other.pathProgress);
+      if (gap < bestGap) {
+        bestGap = gap;
+        bestLead = other;
+      }
+    });
+
+    if (!bestLead) return null;
+    return { car: bestLead, gapProgress: bestGap, gapPixels: bestGap * TRACK_SEGMENT_AVG };
+  }
+
+  getAIStraightnessAhead(startIndex, sampleCount = 6) {
+    let minStraightness = 1;
+
+    for (let i = 0; i < sampleCount; i += 1) {
+      const wp = WAYPOINTS[(startIndex + i) % WP_COUNT];
+      minStraightness = Math.min(minStraightness, wp.s);
+    }
+
+    return minStraightness;
   }
 
   // ── AI movement ──
@@ -880,49 +1424,59 @@ export class GameScene extends Phaser.Scene {
       if (this.preRace) { car.sprite.body.setVelocity(0, 0); return; }
 
       const sprite = car.sprite;
+      car.aggroTimer = Math.max(0, car.aggroTimer - delta);
+      car.aiTrafficState = 'follow';
+      car.aiLaneTarget = 0;
+      car.aiLaneOffset = 0;
 
-      // Verstappen aggro mode
+      const currentPoint = this.sampleTrackPoint(car.pathProgress);
+      const lead = this.findLeadCar(car);
+      const desiredGap = 96;
+      let targetSpeed = AI_MAX_SPEED * currentPoint.s * car.speedMult * car.aiCruiseScale * this.getSealSlowMultiplier(sprite);
+
       if (car.aggroTimer > 0) {
-        car.aggroTimer -= delta;
-        const dx = this.player.x - sprite.x;
-        const dy = this.player.y - sprite.y;
-        const dist = Math.hypot(dx, dy) || 1;
-        const speed = AI_MAX_SPEED * 0.8;
-        sprite.body.setVelocity(dx/dist * speed, dy/dist * speed);
-        sprite.setAngle(Phaser.Math.RadToDeg(Math.atan2(dy, dx)) + 90);
-        if (car.smokeEmitter) car.smokeEmitter.setPosition(sprite.x, sprite.y);
-        return;
+        targetSpeed *= 1.06;
       }
 
-      // Normal waypoint following
-      let wp = WAYPOINTS[car.wpIndex];
-      const dx = wp.x - sprite.x;
-      const dy = wp.y - sprite.y;
-      const dist = Math.hypot(dx, dy);
-
-      if (dist < 30) {
-        car.wpIndex = (car.wpIndex + 1) % WP_COUNT;
-        wp = WAYPOINTS[car.wpIndex];
+      if (lead) {
+        const leadSpeed = lead.car.aiSpeed ?? 0;
+        if (lead.gapPixels < desiredGap * 1.8) {
+          const followBlend = Phaser.Math.Clamp((lead.gapPixels - 28) / (desiredGap * 1.8 - 28), 0, 1);
+          const cappedLeadSpeed = leadSpeed * (0.35 + followBlend * 0.65);
+          targetSpeed = Math.min(targetSpeed, cappedLeadSpeed);
+        }
+        if (lead.gapPixels < desiredGap) {
+          targetSpeed = Math.min(targetSpeed, leadSpeed * 0.92);
+        }
       }
 
-      const targetSpeed = AI_MAX_SPEED * wp.s * car.speedMult;
-      const angle = Math.atan2(dy, dx);
+      const speedBlend = targetSpeed >= car.aiSpeed
+        ? Phaser.Math.Clamp(delta / 850, 0.03, 0.12)
+        : Phaser.Math.Clamp(delta / 320, 0.08, 0.28);
+      car.aiSpeed = Phaser.Math.Linear(car.aiSpeed, targetSpeed, speedBlend);
+      car.aiSpeed = Math.max(0, Math.min(car.aiSpeed, AI_MAX_SPEED * 1.05));
 
-      // Slight swerve for damaged cars
-      let swerve = 0;
-      if (car.state >= 1) {
-        car.swerveAngle += delta * 0.003 * (car.state + 1);
-        swerve = Math.sin(car.swerveAngle) * 0.4 * car.state;
-      }
+      const prevX = sprite.x;
+      const prevY = sprite.y;
+      const progressAdvance = (car.aiSpeed * (delta / 1000)) / TRACK_SEGMENT_AVG;
+      car.pathProgress = Phaser.Math.Wrap(car.pathProgress + progressAdvance, 0, WP_COUNT);
+      car.wpIndex = Math.floor(car.pathProgress) % WP_COUNT;
 
-      sprite.body.setVelocity(
-        Math.cos(angle + swerve) * targetSpeed,
-        Math.sin(angle + swerve) * targetSpeed
-      );
-      sprite.setAngle(Phaser.Math.RadToDeg(angle + swerve) + 90);
+      const point = this.sampleTrackPoint(car.pathProgress);
+      const headingPoint = this.sampleTrackPoint(car.pathProgress + 0.65);
+      const velocityX = (point.x - prevX) / Math.max(delta / 1000, 0.001);
+      const velocityY = (point.y - prevY) / Math.max(delta / 1000, 0.001);
 
-      // Move smoke emitter
-      if (car.smokeEmitter) car.smokeEmitter.setPosition(sprite.x, sprite.y);
+      sprite.body.reset(point.x, point.y);
+      sprite.body.setVelocity(velocityX, velocityY);
+
+      const targetHeading = Phaser.Math.RadToDeg(headingPoint.angle) + 90;
+      const turnBlend = Phaser.Math.Clamp(delta / 220, 0.08, 0.24);
+      const deltaHeading = Phaser.Math.Angle.ShortestBetween(car.aiHeading, targetHeading);
+      car.aiHeading += deltaHeading * turnBlend;
+      sprite.setAngle(car.aiHeading);
+
+      if (car.smokeEmitter) car.smokeEmitter.setPosition(point.x, point.y);
     });
   }
 
@@ -946,15 +1500,15 @@ export class GameScene extends Phaser.Scene {
       this.flashScreen(0xFFFF00);
     }
 
-    // ── T to toggle jet/car transform ──
+    // ── T to cycle transformations ──
     if (Phaser.Input.Keyboard.JustDown(this.tKey)) {
       this.transformToggle();
     }
 
-    const up    = this.cursors.up.isDown    || this.wasd.up.isDown;
-    const down  = this.cursors.down.isDown  || this.wasd.down.isDown;
-    const left  = this.cursors.left.isDown  || this.wasd.left.isDown;
-    const right = this.cursors.right.isDown || this.wasd.right.isDown;
+    const up    = this.cursors.up.isDown    || this.wasd.up.isDown    || this.touchControls.up;
+    const down  = this.cursors.down.isDown  || this.wasd.down.isDown  || this.touchControls.down;
+    const left  = this.cursors.left.isDown  || this.wasd.left.isDown  || this.touchControls.left;
+    const right = this.cursors.right.isDown || this.wasd.right.isDown || this.touchControls.right;
 
     // ── GigaCat mid-pounce — override input ──
     if (this.gigaCatPouncing) {
@@ -1003,7 +1557,7 @@ export class GameScene extends Phaser.Scene {
         this.player.setTexture('player_car');
         this.player.body.setSize(14, 28);
         this.player.body.setMaxVelocity(PLAYER_MAX_SPEED, PLAYER_MAX_SPEED);
-        this.modeText.setText('🚗 CAR  [T=TRANSFORM | SPC=TURBO]').setColor('#AAFFAA');
+        this.setModeDisplay('🚗 CAR  [T=TRANSFORM | SPC=TURBO]', 'CAR  |  FORM / ACT', '#AAFFAA');
         this.turboBarTitle.setText('TURBO').setColor('#AAAAAA');
         this.showComboText('💥 ROCKET SPENT!');
         this.flashScreen(0xFF6600);
@@ -1018,7 +1572,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Tick turbo timers (car mode only)
-    if (!this.isJet && !this.isGigarocket && !this.isTank && !this.isGigaCat) {
+    if (!this.isJet && !this.isGigarocket && !this.isTank && !this.isGigaCat && !this.isSeal) {
       if (this.turboActive) {
         this.turboTimer -= delta;
         if (this.turboTimer <= 0) {
@@ -1034,21 +1588,28 @@ export class GameScene extends Phaser.Scene {
     if (this.isGigaCat && this.gigaCatPounceCooldown > 0) {
       this.gigaCatPounceCooldown = Math.max(0, this.gigaCatPounceCooldown - delta);
     }
+    if (this.isSeal && this.sealFartCooldown > 0) {
+      this.sealFartCooldown = Math.max(0, this.sealFartCooldown - delta);
+    }
 
+    const sealSlowMult = this.getSealSlowMultiplier(this.player);
     const maxSpeed = this.isJet ? JET_SPEED
       : this.isGigarocket ? GIGAROCKET_SPEED
       : this.isTank ? TANK_SPEED
       : this.isGigaCat ? GIGACAT_SPEED
+      : this.isSeal ? SEAL_SPEED
       : (this.turboActive ? PLAYER_TURBO_SPEED : PLAYER_MAX_SPEED);
     const ACCEL = this.isJet ? 1800
       : this.isGigarocket ? 400
       : this.isTank ? 500
       : this.isGigaCat ? 700
+      : this.isSeal ? 540
       : (this.turboActive ? 2200 : 600);
     const TURN  = this.isJet ? 95
       : this.isGigarocket ? 55
       : this.isTank ? TANK_TURN
       : this.isGigaCat ? 110
+      : this.isSeal ? 105
       : (this.turboActive ? 120 : 160);
 
     if (up) {
@@ -1066,8 +1627,9 @@ export class GameScene extends Phaser.Scene {
 
     // Clamp speed
     const speed = Math.hypot(this.player.body.velocity.x, this.player.body.velocity.y);
-    if (speed > maxSpeed) {
-      const factor = maxSpeed / speed;
+    const slowedMaxSpeed = maxSpeed * sealSlowMult;
+    if (speed > slowedMaxSpeed) {
+      const factor = slowedMaxSpeed / speed;
       this.player.body.velocity.x *= factor;
       this.player.body.velocity.y *= factor;
     }
@@ -1076,6 +1638,9 @@ export class GameScene extends Phaser.Scene {
     if (this.isGigaCat) {
       const pulse = Math.sin(this.time.now * 0.005) > 0;
       this.player.setTint(pulse ? 0xFF9900 : 0xFFDD44);
+    } else if (this.isSeal) {
+      const pulse = Math.sin(this.time.now * 0.006) > 0;
+      this.player.setTint(pulse ? 0xDFFBFF : 0xFFFFFF);
     } else if (this.isTank) {
       const pulse = Math.sin(this.time.now * 0.006) > 0;
       this.player.setTint(pulse ? 0x88BB33 : 0xAADD55);
@@ -1093,12 +1658,12 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Engine audio
-    const audioSpeed = (this.isJet || this.turboActive || this.isGigarocket || this.isTank || this.isGigaCat) ? 1.0 : speed / PLAYER_MAX_SPEED;
+    const audioSpeed = (this.isJet || this.turboActive || this.isGigarocket || this.isTank || this.isGigaCat || this.isSeal) ? 1.0 : speed / PLAYER_MAX_SPEED;
     this.audio.setSpeed(audioSpeed);
 
     // Speed HUD
     const kmh = Math.round(speed * 0.5);
-    this.speedText.setText(kmh + ' km/h' + (this.isGigaCat ? ' 🐱' : this.isTank ? ' 🪖' : this.isGigarocket ? ' 🚀' : this.isJet ? ' ✈' : this.turboActive ? ' ⚡' : ''));
+    this.speedText.setText(kmh + ' km/h' + (this.isGigaCat ? ' 🐱' : this.isSeal ? ' 🦭' : this.isTank ? ' 🪖' : this.isGigarocket ? ' 🚀' : this.isJet ? ' ✈' : this.turboActive ? ' ⚡' : ''));
 
     // Bar HUD
     this.updateTurboBar();
@@ -1119,6 +1684,17 @@ export class GameScene extends Phaser.Scene {
       } else {
         this.turboBarFill.setSize(BAR_W, 10).setFillStyle(0xFF8C00);
         this.turboBarLabel.setText('POUNCE!').setColor('#FFCC44');
+      }
+      return;
+    }
+    if (this.isSeal) {
+      if (this.sealFartCooldown > 0) {
+        const frac = 1 - (this.sealFartCooldown / SEAL_FART_COOLDOWN);
+        this.turboBarFill.setSize(BAR_W * frac, 10).setFillStyle(0x7ACB6B);
+        this.turboBarLabel.setText('VENTING').setColor('#A8F08C');
+      } else {
+        this.turboBarFill.setSize(BAR_W, 10).setFillStyle(0x8EE07E);
+        this.turboBarLabel.setText('PUFF!').setColor('#D7FFD0');
       }
       return;
     }
@@ -1192,6 +1768,10 @@ export class GameScene extends Phaser.Scene {
       this.pounceCat();
       return true;
     }
+    if (this.isSeal) {
+      this.releaseSealFart();
+      return true;
+    }
     if (!this.turboActive && this.turboCooldownTimer <= 0) {
       this.turboActive = true;
       this.turboTimer = TURBO_DURATION;
@@ -1212,8 +1792,27 @@ export class GameScene extends Phaser.Scene {
     return this.getDebugState();
   }
 
+  debugWarpToWaypoint(index = 0) {
+    if (!this.player?.body) return this.getDebugState();
+
+    const safeIndex = Phaser.Math.Wrap(Math.round(index), 0, WP_COUNT);
+    const wp = WAYPOINTS[safeIndex];
+    const wpNext = WAYPOINTS[(safeIndex + 1) % WP_COUNT];
+    const angle = Math.atan2(wpNext.y - wp.y, wpNext.x - wp.x);
+
+    this.player.setPosition(wp.x, wp.y);
+    this.player.body.setVelocity(0, 0);
+    this.player.setAngle(Phaser.Math.RadToDeg(angle) + 90);
+    return this.getDebugState();
+  }
+
+  debugWarpToProgress(progress = 0) {
+    const wrapped = ((Number(progress) % 1) + 1) % 1;
+    return this.debugWarpToWaypoint(Math.floor(WP_COUNT * wrapped));
+  }
+
   debugSetMode(mode) {
-    const allowedModes = ['car', 'jet', 'gigarocket', 'tank', 'gigacat'];
+    const allowedModes = ['car', 'jet', 'gigarocket', 'tank', 'gigacat', 'seal'];
     if (!allowedModes.includes(mode)) return this.getDebugState();
 
     let guard = 0;
@@ -1224,21 +1823,21 @@ export class GameScene extends Phaser.Scene {
     return this.getDebugState();
   }
 
-  // ── Transform: cycle Car → Jet → Gigarocket → Car ──
+  // ── Transform: cycle Car → Jet → Gigarocket → Tank → GigaCat → Seal → Car ──
   transformToggle() {
     // Can't transform while charging/pouncing
     if (this.gigarocketCharging || this.gigaCatPouncing) return;
 
     this.audio.playTransform && this.audio.playTransform();
 
-    if (!this.isJet && !this.isGigarocket && !this.isTank && !this.isGigaCat) {
+    if (!this.isJet && !this.isGigarocket && !this.isTank && !this.isGigaCat && !this.isSeal) {
       // ── Car → Jet ──
       this.isJet = true;
       this.turboActive = false;
       this.player.setTexture('jet');
       this.player.body.setSize(32, 40);
       this.player.body.setMaxVelocity(JET_SPEED, JET_SPEED);
-      this.modeText.setText('✈ JET  [T=GIGA | SPACE=FIRE]').setColor('#FF9900');
+      this.setModeDisplay('✈ JET  [T=GIGA | SPACE=FIRE]', 'JET  |  FORM / ACT', '#FF9900');
       this.turboBarTitle.setText('MISSILE').setColor('#FF8844');
       this.showComboText('✈ JET MODE!');
       this.flashScreen(0xFF6600);
@@ -1253,7 +1852,7 @@ export class GameScene extends Phaser.Scene {
       this.player.body.setSize(54, 88);
       this.player.body.setMaxVelocity(GIGAROCKET_SPEED, GIGAROCKET_SPEED);
       this.player.body.setVelocity(0, 0);
-      this.modeText.setText('🚀 GIGA  [T=TANK | SPACE=LAUNCH!]').setColor('#FF3300');
+      this.setModeDisplay('🚀 GIGA  [T=TANK | SPACE=LAUNCH!]', 'GIGA  |  FORM / ACT', '#FF3300');
       this.turboBarTitle.setText('LAUNCH').setColor('#FF4422');
       this.showComboText('🚀 GIGAROCKET ARMED!');
       this.flashScreen(0xFF2200);
@@ -1268,7 +1867,7 @@ export class GameScene extends Phaser.Scene {
       this.player.body.setSize(40, 34);
       this.player.body.setMaxVelocity(TANK_SPEED, TANK_SPEED);
       this.player.body.setVelocity(0, 0);
-      this.modeText.setText('🪖 TANK  [T=CAT | SPACE=FIRE]').setColor('#AACC44');
+      this.setModeDisplay('🪖 TANK  [T=CAT | SPACE=FIRE]', 'TANK  |  FORM / ACT', '#AACC44');
       this.turboBarTitle.setText('SHELL').setColor('#AACC44');
       this.showComboText('🪖 TANK MODE!');
       this.flashScreen(0x88AA22);
@@ -1286,22 +1885,41 @@ export class GameScene extends Phaser.Scene {
       this.player.body.setSize(48, 52);
       this.player.body.setMaxVelocity(GIGACAT_SPEED, GIGACAT_SPEED);
       this.player.body.setVelocity(0, 0);
-      this.modeText.setText('🐱 GIGACAT  [T=CAR | SPACE=POUNCE]').setColor('#FFAA33');
+      this.setModeDisplay('🐱 GIGACAT  [T=SEAL | SPACE=POUNCE]', 'CAT  |  FORM / ACT', '#FFAA33');
       this.turboBarTitle.setText('POUNCE').setColor('#FFAA33');
       this.showComboText('😾 GIGACAT UNLEASHED!');
       this.flashScreen(0xFF8C00);
       this.audio.playCatPounce && this.audio.playCatPounce();
 
-    } else {
-      // ── GigaCat (or any leftover) → Car ──
+    } else if (this.isGigaCat) {
+      // ── GigaCat → Seal ──
       this.isGigaCat = false;
       this.gigaCatPouncing = false;
+      this.gigaCatPounceCooldown = 0;
+      this.isSeal = true;
+      this.sealFartCooldown = 0;
+      this.player.setScale(1);
+      this.player.setTexture('seal');
+      this.player.body.setSize(42, 44);
+      this.player.body.setMaxVelocity(SEAL_SPEED, SEAL_SPEED);
+      this.player.body.setVelocity(0, 0);
+      this.setModeDisplay('🦭 SEAL  [T=CAR | SPACE=PUFF]', 'SEAL  |  FORM / ACT', '#E8F7FF');
+      this.turboBarTitle.setText('GAS').setColor('#B9FFAA');
+      this.showComboText('🦭 SEAL MODE!');
+      this.flashScreen(0xDFFBFF);
+
+    } else {
+      // ── Seal (or any leftover) → Car ──
+      this.isGigaCat = false;
+      this.gigaCatPouncing = false;
+      this.gigaCatPounceCooldown = 0;
+      this.isSeal = false;
       this.player.setScale(1);
       this.player.setTexture('player_car');
       this.player.body.setSize(14, 28);
       this.player.body.setMaxVelocity(PLAYER_MAX_SPEED, PLAYER_MAX_SPEED);
       this.player.body.setVelocity(0, 0);
-      this.modeText.setText('🚗 CAR  [T=TRANSFORM | SPC=TURBO]').setColor('#AAFFAA');
+      this.setModeDisplay('🚗 CAR  [T=TRANSFORM | SPC=TURBO]', 'CAR  |  FORM / ACT', '#AAFFAA');
       this.turboBarTitle.setText('TURBO').setColor('#AAAAAA');
       this.showComboText('🚗 CAR MODE');
       this.flashScreen(0x00FF88);
@@ -1423,6 +2041,63 @@ export class GameScene extends Phaser.Scene {
 
     if (stomped > 1) this.showComboText(`😾 MULTI-STOMP ×${stomped}!`);
     else if (stomped === 0) this.showCommentator('The cat pounced… and missed. Graceful.');
+  }
+
+  releaseSealFart() {
+    if (this.sealFartCooldown > 0) return;
+
+    this.sealFartCooldown = SEAL_FART_COOLDOWN;
+    const rad = Phaser.Math.DegToRad(this.player.angle - 90);
+    const behindRad = rad + Math.PI;
+    const spawnX = this.player.x + Math.cos(behindRad) * 120;
+    const spawnY = this.player.y + Math.sin(behindRad) * 120;
+    const cloud = this.add.image(spawnX, spawnY, 'seal_fart')
+      .setDepth(7)
+      .setAlpha(0.85)
+      .setScale((SEAL_FART_RADIUS * 2) / 96);
+
+    this.sealClouds.push({
+      sprite: cloud,
+      radius: SEAL_FART_RADIUS,
+      expiresAt: this.time.now + SEAL_FART_DURATION,
+    });
+
+    this.tweens.add({
+      targets: cloud,
+      alpha: 0.35,
+      scaleX: cloud.scaleX * 1.12,
+      scaleY: cloud.scaleY * 1.12,
+      duration: SEAL_FART_DURATION,
+      ease: 'Sine.Out',
+    });
+
+    this.flashScreen(0x96DB76);
+    this.showComboText('💨 STINK CLOUD!');
+    this.cameras.main.shake(120, 0.006);
+  }
+
+  getSealSlowMultiplier(target) {
+    if (!target || !this.sealClouds.length) return 1;
+
+    const x = target.x ?? target.sprite?.x;
+    const y = target.y ?? target.sprite?.y;
+    if (typeof x !== 'number' || typeof y !== 'number') return 1;
+
+    for (const cloud of this.sealClouds) {
+      if (!cloud.sprite?.active) continue;
+      const dist = Math.hypot(cloud.sprite.x - x, cloud.sprite.y - y);
+      if (dist <= cloud.radius) return SEAL_FART_SLOW_MULT;
+    }
+    return 1;
+  }
+
+  updateSealClouds() {
+    const now = this.time.now;
+    this.sealClouds = this.sealClouds.filter(cloud => {
+      const active = cloud.sprite?.active && now < cloud.expiresAt;
+      if (!active) cloud.sprite?.destroy();
+      return active;
+    });
   }
 
   // ── Fire tank shell straight ahead ──
@@ -1596,6 +2271,8 @@ export class GameScene extends Phaser.Scene {
   // ── Update ──
   update(time, delta) {
     this.updatePlayer(delta);
+    this.checkPlayerCarImpacts();
+    this.updateSealClouds();
     this.updateAI(delta);
     this.updateMinimap();
     this.updateHUD();

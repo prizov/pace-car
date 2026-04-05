@@ -45,6 +45,8 @@ test('boots and exercises the core transformation loop', async ({ page }) => {
   );
   expect(missileState.targetedCar).not.toBeNull();
 
+  await page.evaluate(() => window.__PACE_CAR__.actions.warpToProgress(0.18));
+
   await page.evaluate(() => window.__PACE_CAR__.actions.setMode('gigarocket'));
   const rocketState = await waitForState(
     page,
@@ -65,6 +67,8 @@ test('boots and exercises the core transformation loop', async ({ page }) => {
     8_000,
   );
 
+  await page.evaluate(() => window.__PACE_CAR__.actions.warpToProgress(0.34));
+
   await page.evaluate(() => window.__PACE_CAR__.actions.setMode('tank'));
   const tankState = await waitForState(
     page,
@@ -79,6 +83,8 @@ test('boots and exercises the core transformation loop', async ({ page }) => {
   );
   expect(shellState.tankShellCooldown).toBeGreaterThan(0);
 
+  await page.evaluate(() => window.__PACE_CAR__.actions.warpToProgress(0.52));
+
   await page.evaluate(() => window.__PACE_CAR__.actions.setMode('gigacat'));
   const catState = await waitForState(
     page,
@@ -92,6 +98,28 @@ test('boots and exercises the core transformation loop', async ({ page }) => {
     () => window.__PACE_CAR__?.getState()?.gigaCatPouncing === true,
   );
   expect(pounceState.gigaCatPouncing).toBe(true);
+
+  await waitForState(
+    page,
+    () => window.__PACE_CAR__?.getState()?.gigaCatPouncing === false,
+    8_000,
+  );
+
+  await page.evaluate(() => window.__PACE_CAR__.actions.warpToProgress(0.7));
+
+  await page.evaluate(() => window.__PACE_CAR__.actions.setMode('seal'));
+  const sealState = await waitForState(
+    page,
+    () => window.__PACE_CAR__?.getState()?.mode === 'seal',
+  );
+  expect(sealState.mode).toBe('seal');
+
+  await page.evaluate(() => window.__PACE_CAR__.actions.activatePrimary());
+  const gasState = await waitForState(
+    page,
+    () => window.__PACE_CAR__?.getState()?.sealFartCooldown > 0 && window.__PACE_CAR__.getState().sealClouds > 0,
+  );
+  expect(gasState.sealClouds).toBeGreaterThan(0);
 
   await page.screenshot({ path: 'test-results/smoke-final-state.png' });
 });

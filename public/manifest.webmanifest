@@ -1,0 +1,19 @@
+{
+  "name": "Pace Car Mayhem",
+  "short_name": "Pace Car",
+  "description": "Chaotic Formula-style pace car action game.",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#000000",
+  "theme_color": "#0b1614",
+  "start_url": "./?skipIntro=1",
+  "scope": "./",
+  "icons": [
+    {
+      "src": "./assets/sprites/pixellab/pace-car.png",
+      "sizes": "96x96",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

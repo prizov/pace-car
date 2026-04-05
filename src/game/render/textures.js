@@ -1,6 +1,30 @@
 import { WAYPOINTS } from '../data/content.js';
 
 // ── Asset generation helpers ────────────────────────────────
+export function makeTextureFromImage(scene, sourceKey, targetKey, width, height, options = {}) {
+  const { flipY = false } = options;
+  const sourceImage = scene.textures.get(sourceKey)?.getSourceImage();
+  if (!sourceImage) return false;
+
+  const canvasTexture = scene.textures.createCanvas(targetKey, width, height);
+  const ctx = canvasTexture.getContext();
+  ctx.clearRect(0, 0, width, height);
+  ctx.imageSmoothingEnabled = false;
+
+  if (flipY) {
+    ctx.save();
+    ctx.translate(0, height);
+    ctx.scale(1, -1);
+    ctx.drawImage(sourceImage, 0, 0, width, height);
+    ctx.restore();
+  } else {
+    ctx.drawImage(sourceImage, 0, 0, width, height);
+  }
+
+  canvasTexture.refresh();
+  return true;
+}
+
 export function makeCarTexture(scene, key, bodyColor, accentColor, isPlayer=false) {
   const g = scene.make.graphics({ x:0, y:0, add:false });
   const W = 18, H = 34;
@@ -58,9 +82,9 @@ export function makeExplosionTexture(scene) {
   g.destroy();
 }
 
-export function makeWreckTexture(scene, key, bodyColor) {
+export function makeWreckTexture(scene, key, bodyColor, width = 18, height = 34) {
   const g = scene.make.graphics({ x:0, y:0, add:false });
-  const W = 18, H = 34;
+  const W = width, H = height;
   g.fillStyle(0x222222, 1);
   g.fillRoundedRect(2, 4, W-4, H-8, 4);
   g.fillStyle(bodyColor, 0.4);
@@ -349,6 +373,75 @@ export function makeGigaCatTexture(scene) {
   g.destroy();
 }
 
+export function makeSealTexture(scene) {
+  const g = scene.make.graphics({ x:0, y:0, add:false });
+  const SW = 72, SH = 72;
+  // Shadow
+  g.fillStyle(0x000000, 0.18);
+  g.fillEllipse(SW / 2 + 2, SH / 2 + 8, SW - 12, SH - 26);
+  // Puffy round body
+  g.fillStyle(0xF7FBFF, 1);
+  g.fillEllipse(SW / 2, SH / 2 + 10, SW - 10, SH - 20);
+  g.fillStyle(0xE8F2FA, 0.8);
+  g.fillEllipse(SW / 2, SH / 2 + 6, SW - 22, SH - 28);
+  // Flippers
+  g.fillStyle(0xD9E5EF, 1);
+  g.fillEllipse(17, SH - 19, 18, 24);
+  g.fillEllipse(SW - 17, SH - 19, 18, 24);
+  g.fillEllipse(22, SH / 2 + 10, 14, 22);
+  g.fillEllipse(SW - 22, SH / 2 + 10, 14, 22);
+  // Face
+  g.fillStyle(0xFFFFFF, 1);
+  g.fillCircle(SW / 2, 22, 22);
+  g.fillStyle(0x111111, 1);
+  g.fillEllipse(SW / 2 - 9, 21, 11, 14);
+  g.fillEllipse(SW / 2 + 9, 21, 11, 14);
+  g.fillStyle(0xFFFFFF, 0.95);
+  g.fillCircle(SW / 2 - 7, 18, 2);
+  g.fillCircle(SW / 2 + 11, 18, 2);
+  g.fillStyle(0xFFB9C8, 0.85);
+  g.fillCircle(SW / 2 - 14, 25, 4);
+  g.fillCircle(SW / 2 + 14, 25, 4);
+  g.fillStyle(0x444444, 1);
+  g.fillTriangle(SW / 2 - 4, 29, SW / 2 + 4, 29, SW / 2, 33);
+  g.lineStyle(1, 0x666666, 0.7);
+  g.lineBetween(SW / 2, 33, SW / 2 - 6, 36);
+  g.lineBetween(SW / 2, 33, SW / 2 + 6, 36);
+  g.lineBetween(SW / 2 - 5, 31, SW / 2 - 18, 30);
+  g.lineBetween(SW / 2 - 5, 33, SW / 2 - 18, 35);
+  g.lineBetween(SW / 2 + 5, 31, SW / 2 + 18, 30);
+  g.lineBetween(SW / 2 + 5, 33, SW / 2 + 18, 35);
+  // Fur tufts
+  g.fillStyle(0xFFFFFF, 1);
+  g.fillTriangle(SW / 2 - 18, 9, SW / 2 - 11, 1, SW / 2 - 6, 10);
+  g.fillTriangle(SW / 2 + 18, 9, SW / 2 + 11, 1, SW / 2 + 6, 10);
+  g.generateTexture('seal', SW, SH);
+  g.destroy();
+}
+
+export function makeSealFartTexture(scene) {
+  const g = scene.make.graphics({ x:0, y:0, add:false });
+  const S = 96;
+  const blobs = [
+    [28, 56, 18],
+    [46, 46, 24],
+    [68, 54, 20],
+    [56, 70, 16],
+    [34, 74, 14],
+    [76, 72, 12],
+  ];
+  g.fillStyle(0x74C96B, 0.72);
+  blobs.forEach(([x, y, r]) => g.fillCircle(x, y, r));
+  g.fillStyle(0x8EE07E, 0.5);
+  blobs.forEach(([x, y, r]) => g.fillCircle(x - 4, y - 5, Math.max(6, r - 6)));
+  g.fillStyle(0xA6F08E, 0.35);
+  g.fillCircle(44, 44, 10);
+  g.fillCircle(63, 58, 8);
+  g.fillCircle(36, 67, 7);
+  g.generateTexture('seal_fart', S, S);
+  g.destroy();
+}
+
 export function makeGigaCatPawTexture(scene) {
   // Paw print shockwave for stomp landing
   const g = scene.make.graphics({ x:0, y:0, add:false });
@@ -541,9 +634,9 @@ export function makeTrackTexture(scene) {
   g.destroy();
 }
 
-// Minimap constants — computed from actual waypoint bounding box
-const MM_TRACK_X0 = 830, MM_TRACK_Y0 = 240;
-const MM_TRACK_W  = 2800, MM_TRACK_H = 2240; // track spans ~830-3630 x, ~240-2480 y
+// Minimap constants — tuned to the smoothed Silverstone centerline bounds
+const MM_TRACK_X0 = 460, MM_TRACK_Y0 = 120;
+const MM_TRACK_W  = 3220, MM_TRACK_H = 2440;
 const MM_W = 160, MM_H = 120, MM_PAD = 6;
 const MM_SX = (MM_W - MM_PAD * 2) / MM_TRACK_W;
 const MM_SY = (MM_H - MM_PAD * 2) / MM_TRACK_H;
