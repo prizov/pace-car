@@ -39,6 +39,7 @@ export class GameScene extends Phaser.Scene {
   constructor() { super({ key:'GameScene' }); }
 
   init() {
+    this.devFlags = window.__PACE_CAR_DEV__ || {};
     this.score = 0;
     this.carsRemaining = 22;
     this.lastDestroyTime = 0;
@@ -242,8 +243,13 @@ export class GameScene extends Phaser.Scene {
     // ── Sponsor boards ──
     this.createSponsorBoards();
 
+    if (this.devFlags.debug) {
+      this.createDebugOverlay();
+    }
+
     // ── Start sequence ──
-    this.startLightsSequence();
+    if (this.devFlags.skipIntro) this.startRaceNow();
+    else this.startLightsSequence();
   }
 
   // ── Sponsor / advertising boards around the circuit ──
@@ -420,6 +426,11 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
+  startRaceNow() {
+    this.preRace = false;
+    this.updateHUD();
+  }
+
   // ── Smoke emitter ──
   createSmokeEmitter(target, intensity=0.5) {
     const emitter = this.add.particles(target.x, target.y, 'smoke', {
@@ -477,6 +488,15 @@ export class GameScene extends Phaser.Scene {
       fontSize:'10px', fontFamily:'monospace', color:'#00FFFF',
       stroke:'#000', strokeThickness:2,
     }).setOrigin(1, 0.5).setScrollFactor(0).setDepth(92);
+  }
+
+  createDebugOverlay() {
+    this.debugText = this.add.text(16, 168, '', {
+      fontSize:'11px', fontFamily:'monospace', color:'#FFFFFF',
+      stroke:'#000', strokeThickness:3,
+      backgroundColor:'#00000088',
+      padding:{ x:8, y:6 },
+    }).setScrollFactor(0).setDepth(95);
   }
 
   // ── Minimap ──
@@ -801,6 +821,58 @@ export class GameScene extends Phaser.Scene {
     this.carsText.setText(`CARS: ${this.carsRemaining} / 22`);
   }
 
+  getModeName() {
+    if (this.gigaCatPouncing || this.isGigaCat) return 'gigacat';
+    if (this.gigarocketCharging || this.isGigarocket) return 'gigarocket';
+    if (this.isTank) return 'tank';
+    if (this.isJet) return 'jet';
+    return 'car';
+  }
+
+  getDebugState() {
+    const speed = Math.round(Math.hypot(this.player.body.velocity.x, this.player.body.velocity.y));
+    return {
+      ready: true,
+      scene: this.scene.key,
+      preRace: this.preRace,
+      mode: this.getModeName(),
+      score: this.score,
+      carsRemaining: this.carsRemaining,
+      speed,
+      turboActive: this.turboActive,
+      turboCooldownTimer: this.turboCooldownTimer,
+      missileCooldown: this.missileCooldown,
+      tankShellCooldown: this.tankShellCooldown,
+      gigarocketCharging: this.gigarocketCharging,
+      gigaCatPouncing: this.gigaCatPouncing,
+      player: {
+        x: Math.round(this.player.x),
+        y: Math.round(this.player.y),
+        angle: Math.round(this.player.angle),
+      },
+      targetedCar: this.targetedCar?.driver?.name ?? null,
+    };
+  }
+
+  updateDebugOverlay() {
+    if (!this.debugText) return;
+    const state = this.getDebugState();
+    this.debugText.setText([
+      `scene: ${state.scene}`,
+      `mode: ${state.mode}`,
+      `preRace: ${state.preRace}`,
+      `speed: ${state.speed}`,
+      `cars: ${state.carsRemaining}`,
+      `score: ${state.score}`,
+      `turbo: ${state.turboActive ? 'on' : 'off'}`,
+      `missileCd: ${Math.ceil(state.missileCooldown)}`,
+      `shellCd: ${Math.ceil(state.tankShellCooldown)}`,
+      `rocket: ${state.gigarocketCharging ? 'burning' : 'idle'}`,
+      `cat: ${state.gigaCatPouncing ? 'pouncing' : 'grounded'}`,
+      `target: ${state.targetedCar ?? '-'}`,
+    ]);
+  }
+
   // ── AI movement ──
   updateAI(delta) {
     this.f1Cars.forEach(car => {
@@ -942,21 +1014,7 @@ export class GameScene extends Phaser.Scene {
 
     // ── Space: mode-dependent action ──
     if (Phaser.Input.Keyboard.JustDown(this.spaceKey)) {
-      if (this.isJet) {
-        this.fireMissile();
-      } else if (this.isGigarocket) {
-        this.launchGigarocket();
-      } else if (this.isTank) {
-        this.fireTankShell();
-      } else if (this.isGigaCat) {
-        this.pounceCat();
-      } else if (!this.turboActive && this.turboCooldownTimer <= 0) {
-        this.turboActive = true;
-        this.turboTimer = TURBO_DURATION;
-        this.flashScreen(0x00FFFF);
-        this.showComboText('TURBO!');
-        this.audio.playTurbo && this.audio.playTurbo();
-      }
+      this.activatePrimaryAbility();
     }
 
     // Tick turbo timers (car mode only)
@@ -1113,6 +1171,57 @@ export class GameScene extends Phaser.Scene {
       this.turboBarFill.setSize(BAR_W, 10).setFillStyle(0x00FF88);
       this.turboBarLabel.setText('READY').setColor('#00FF88');
     }
+  }
+
+  activatePrimaryAbility() {
+    if (this.preRace || this.gigarocketCharging || this.gigaCatPouncing) return false;
+
+    if (this.isJet) {
+      this.fireMissile();
+      return true;
+    }
+    if (this.isGigarocket) {
+      this.launchGigarocket();
+      return true;
+    }
+    if (this.isTank) {
+      this.fireTankShell();
+      return true;
+    }
+    if (this.isGigaCat) {
+      this.pounceCat();
+      return true;
+    }
+    if (!this.turboActive && this.turboCooldownTimer <= 0) {
+      this.turboActive = true;
+      this.turboTimer = TURBO_DURATION;
+      this.flashScreen(0x00FFFF);
+      this.showComboText('TURBO!');
+      this.audio.playTurbo && this.audio.playTurbo();
+      return true;
+    }
+    return false;
+  }
+
+  debugAccelerateForward(boost = 1) {
+    if (this.preRace) return this.getDebugState();
+    const rad = Phaser.Math.DegToRad(this.player.angle - 90);
+    const impulse = PLAYER_MAX_SPEED * Math.max(0.25, boost);
+    this.player.body.velocity.x += Math.cos(rad) * impulse;
+    this.player.body.velocity.y += Math.sin(rad) * impulse;
+    return this.getDebugState();
+  }
+
+  debugSetMode(mode) {
+    const allowedModes = ['car', 'jet', 'gigarocket', 'tank', 'gigacat'];
+    if (!allowedModes.includes(mode)) return this.getDebugState();
+
+    let guard = 0;
+    while (this.getModeName() !== mode && guard < allowedModes.length + 1) {
+      this.transformToggle();
+      guard++;
+    }
+    return this.getDebugState();
   }
 
   // ── Transform: cycle Car → Jet → Gigarocket → Car ──
@@ -1490,6 +1599,7 @@ export class GameScene extends Phaser.Scene {
     this.updateAI(delta);
     this.updateMinimap();
     this.updateHUD();
+    this.updateDebugOverlay();
     this.updateReticle();
     this.updateMissiles(delta);
     this.updateTankShells(delta);
