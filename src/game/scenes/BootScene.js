@@ -24,7 +24,7 @@ export class BootScene extends Phaser.Scene {
   constructor() { super({ key:'BootScene' }); }
 
   preload() {
-    this.load.image('pixellab_pace_car', '/assets/sprites/pixellab/pace-car.png');
+    this.load.image('pixellab_pace_car', 'assets/sprites/pixellab/pace-car.png');
     Object.entries(TEAM_SPRITE_ASSETS).forEach(([team, path]) => {
       this.load.image(`team_sprite_${team}`, path);
     });

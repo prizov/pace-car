@@ -14,17 +14,17 @@ export const TEAMS = {
 };
 
 export const TEAM_SPRITE_ASSETS = {
-  mclaren: '/assets/sprites/teams/mclaren.png',
-  mercedes: '/assets/sprites/teams/mercedes.png',
-  ferrari: '/assets/sprites/teams/ferrari.png',
-  redbull: '/assets/sprites/teams/redbull.png',
-  williams: '/assets/sprites/teams/williams.png',
-  astonmartin: '/assets/sprites/teams/astonmartin.png',
-  racingbulls: '/assets/sprites/teams/racingbulls.png',
-  haas: '/assets/sprites/teams/haas.png',
-  alpine: '/assets/sprites/teams/alpine.png',
-  audi: '/assets/sprites/teams/audi.png',
-  cadillac: '/assets/sprites/teams/cadillac.png',
+  mclaren: 'assets/sprites/teams/mclaren.png',
+  mercedes: 'assets/sprites/teams/mercedes.png',
+  ferrari: 'assets/sprites/teams/ferrari.png',
+  redbull: 'assets/sprites/teams/redbull.png',
+  williams: 'assets/sprites/teams/williams.png',
+  astonmartin: 'assets/sprites/teams/astonmartin.png',
+  racingbulls: 'assets/sprites/teams/racingbulls.png',
+  haas: 'assets/sprites/teams/haas.png',
+  alpine: 'assets/sprites/teams/alpine.png',
+  audi: 'assets/sprites/teams/audi.png',
+  cadillac: 'assets/sprites/teams/cadillac.png',
 };
 
 // Full 2026 grid
