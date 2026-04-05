@@ -85,6 +85,9 @@ export class GameScene extends Phaser.Scene {
       down: false,
       left: false,
       right: false,
+      vectorX: 0,
+      vectorY: 0,
+      magnitude: 0,
     };
     this.touchActionLocks = {
       ability: false,
@@ -600,6 +603,9 @@ export class GameScene extends Phaser.Scene {
       this.touchControls.down = false;
       this.touchControls.left = false;
       this.touchControls.right = false;
+      this.touchControls.vectorX = 0;
+      this.touchControls.vectorY = 0;
+      this.touchControls.magnitude = 0;
       stickKnob.setPosition(stickX, stickY);
       stickKnob.setFillStyle(0x123f39, 0.9);
       stickRing.setFillStyle(0x0d1b1a, 0.32);
@@ -617,6 +623,7 @@ export class GameScene extends Phaser.Scene {
       const threshold = 0.32;
       const activeX = dist > 12 ? (dx / stickTravel) : 0;
       const activeY = dist > 12 ? (dy / stickTravel) : 0;
+      const magnitude = Phaser.Math.Clamp(dist / stickTravel, 0, 1);
 
       stickKnob.setPosition(knobX, knobY);
       stickKnob.setFillStyle(0x27c4a8, 0.96);
@@ -625,6 +632,9 @@ export class GameScene extends Phaser.Scene {
       this.touchControls.right = activeX > threshold;
       this.touchControls.up = activeY < -threshold;
       this.touchControls.down = activeY > threshold;
+      this.touchControls.vectorX = activeX;
+      this.touchControls.vectorY = activeY;
+      this.touchControls.magnitude = magnitude;
     };
 
     stickZone.on('pointerdown', (pointer) => {
@@ -1556,10 +1566,11 @@ export class GameScene extends Phaser.Scene {
       this.transformToggle();
     }
 
-    const up    = this.cursors.up.isDown    || this.wasd.up.isDown    || this.touchControls.up;
-    const down  = this.cursors.down.isDown  || this.wasd.down.isDown  || this.touchControls.down;
-    const left  = this.cursors.left.isDown  || this.wasd.left.isDown  || this.touchControls.left;
-    const right = this.cursors.right.isDown || this.wasd.right.isDown || this.touchControls.right;
+    const touchStickActive = this.touchControls.magnitude > 0.12;
+    const up    = this.cursors.up.isDown    || this.wasd.up.isDown;
+    const down  = this.cursors.down.isDown  || this.wasd.down.isDown;
+    const left  = this.cursors.left.isDown  || this.wasd.left.isDown;
+    const right = this.cursors.right.isDown || this.wasd.right.isDown;
 
     // ── GigaCat mid-pounce — override input ──
     if (this.gigaCatPouncing) {
@@ -1663,18 +1674,29 @@ export class GameScene extends Phaser.Scene {
       : this.isSeal ? 105
       : (this.turboActive ? 120 : 160);
 
-    if (up) {
-      const rad = Phaser.Math.DegToRad(this.player.angle - 90);
-      this.player.body.velocity.x += Math.cos(rad) * ACCEL * (delta/1000);
-      this.player.body.velocity.y += Math.sin(rad) * ACCEL * (delta/1000);
+    if (touchStickActive) {
+      const stickAngle = Math.atan2(this.touchControls.vectorY, this.touchControls.vectorX);
+      const targetHeading = Phaser.Math.RadToDeg(stickAngle) + 90;
+      const turnBlend = Phaser.Math.Clamp((delta / 170) * (TURN / 120), 0.12, 0.4);
+      const deltaHeading = Phaser.Math.Angle.ShortestBetween(this.player.angle, targetHeading);
+      this.player.angle += deltaHeading * turnBlend;
+      const accelScale = Phaser.Math.Clamp(this.touchControls.magnitude, 0.2, 1);
+      this.player.body.velocity.x += Math.cos(stickAngle) * ACCEL * accelScale * (delta/1000);
+      this.player.body.velocity.y += Math.sin(stickAngle) * ACCEL * accelScale * (delta/1000);
+    } else {
+      if (up) {
+        const rad = Phaser.Math.DegToRad(this.player.angle - 90);
+        this.player.body.velocity.x += Math.cos(rad) * ACCEL * (delta/1000);
+        this.player.body.velocity.y += Math.sin(rad) * ACCEL * (delta/1000);
+      }
+      if (down) {
+        const rad = Phaser.Math.DegToRad(this.player.angle - 90);
+        this.player.body.velocity.x -= Math.cos(rad) * ACCEL * 0.5 * (delta/1000);
+        this.player.body.velocity.y -= Math.sin(rad) * ACCEL * 0.5 * (delta/1000);
+      }
+      if (left)  this.player.angle -= TURN * (delta/1000);
+      if (right) this.player.angle += TURN * (delta/1000);
     }
-    if (down) {
-      const rad = Phaser.Math.DegToRad(this.player.angle - 90);
-      this.player.body.velocity.x -= Math.cos(rad) * ACCEL * 0.5 * (delta/1000);
-      this.player.body.velocity.y -= Math.sin(rad) * ACCEL * 0.5 * (delta/1000);
-    }
-    if (left)  this.player.angle -= TURN * (delta/1000);
-    if (right) this.player.angle += TURN * (delta/1000);
 
     // Clamp speed
     const speed = Math.hypot(this.player.body.velocity.x, this.player.body.velocity.y);
