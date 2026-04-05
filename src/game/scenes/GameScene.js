@@ -550,44 +550,101 @@ export class GameScene extends Phaser.Scene {
 
   createTouchControls() {
     const bottomY = H - 142;
-    const leftX = 132;
+    const leftX = 142;
     const rightX = W - 124;
+    const topRightX = W - 76;
+    const topRightY = 168;
     this.touchUi = this.add.container(0, 0).setScrollFactor(0).setDepth(120);
 
-    const makeHoldButton = ({ x, y, label, control, size = 68 }) => {
-      const bg = this.add.circle(x, y, size, 0x0d1b1a, 0.6)
-        .setStrokeStyle(3, 0xb7ffea, 0.28)
-        .setScrollFactor(0)
-        .setDepth(121)
-        .setInteractive({ useHandCursor: false });
-      const text = this.add.text(x, y, label, {
-        fontSize: '30px',
-        fontFamily: 'monospace',
-        color: '#EFFFFA',
-        stroke: '#000',
-        strokeThickness: 4,
-      }).setOrigin(0.5).setScrollFactor(0).setDepth(122);
-      const activePointers = new Set();
-      const syncVisual = () => {
-        const pressed = activePointers.size > 0;
-        this.touchControls[control] = pressed;
-        bg.setFillStyle(pressed ? 0x27c4a8 : 0x0d1b1a, pressed ? 0.9 : 0.6);
-        bg.setScale(pressed ? 0.94 : 1);
-      };
-      const releasePointer = (pointer) => {
-        activePointers.delete(pointer.id);
-        syncVisual();
-      };
-      bg.on('pointerdown', (pointer) => {
-        activePointers.add(pointer.id);
-        syncVisual();
-      });
-      bg.on('pointerup', releasePointer);
-      bg.on('pointerout', releasePointer);
-      bg.on('pointerupoutside', releasePointer);
-      this.input.on('pointerup', releasePointer);
-      this.touchUi.add([bg, text]);
+    const stickBaseRadius = 76;
+    const stickKnobRadius = 34;
+    const stickTravel = 42;
+    const stickX = leftX;
+    const stickY = bottomY - 4;
+
+    const stickRing = this.add.circle(stickX, stickY, stickBaseRadius, 0x0d1b1a, 0.32)
+      .setStrokeStyle(4, 0xb7ffea, 0.3)
+      .setScrollFactor(0)
+      .setDepth(121);
+    const stickCenter = this.add.circle(stickX, stickY, 26, 0xb7ffea, 0.14)
+      .setScrollFactor(0)
+      .setDepth(121);
+    const stickKnob = this.add.circle(stickX, stickY, stickKnobRadius, 0x123f39, 0.9)
+      .setStrokeStyle(3, 0xe4fff6, 0.45)
+      .setScrollFactor(0)
+      .setDepth(122);
+    const stickHint = this.add.text(stickX, stickY + stickBaseRadius + 20, 'drive', {
+      fontSize: '14px',
+      fontFamily: 'monospace',
+      color: '#D9FFF3',
+      stroke: '#000',
+      strokeThickness: 3,
+    }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(121).setAlpha(0.72);
+
+    const stickZone = this.add.zone(stickX, stickY, stickBaseRadius * 2.4, stickBaseRadius * 2.4)
+      .setScrollFactor(0)
+      .setDepth(120)
+      .setInteractive();
+
+    this.touchStick = {
+      pointerId: null,
+      baseX: stickX,
+      baseY: stickY,
+      knob: stickKnob,
+      maxRadius: stickTravel,
     };
+
+    const resetTouchStick = () => {
+      this.touchStick.pointerId = null;
+      this.touchControls.up = false;
+      this.touchControls.down = false;
+      this.touchControls.left = false;
+      this.touchControls.right = false;
+      stickKnob.setPosition(stickX, stickY);
+      stickKnob.setFillStyle(0x123f39, 0.9);
+      stickRing.setFillStyle(0x0d1b1a, 0.32);
+    };
+
+    const updateTouchStick = (pointer) => {
+      const dx = pointer.x - stickX;
+      const dy = pointer.y - stickY;
+      const dist = Math.hypot(dx, dy);
+      const clamped = Math.min(dist, stickTravel);
+      const nx = dist > 0 ? dx / dist : 0;
+      const ny = dist > 0 ? dy / dist : 0;
+      const knobX = stickX + nx * clamped;
+      const knobY = stickY + ny * clamped;
+      const threshold = 0.32;
+      const activeX = dist > 12 ? (dx / stickTravel) : 0;
+      const activeY = dist > 12 ? (dy / stickTravel) : 0;
+
+      stickKnob.setPosition(knobX, knobY);
+      stickKnob.setFillStyle(0x27c4a8, 0.96);
+      stickRing.setFillStyle(0x0d1b1a, 0.5);
+      this.touchControls.left = activeX < -threshold;
+      this.touchControls.right = activeX > threshold;
+      this.touchControls.up = activeY < -threshold;
+      this.touchControls.down = activeY > threshold;
+    };
+
+    stickZone.on('pointerdown', (pointer) => {
+      this.touchStick.pointerId = pointer.id;
+      updateTouchStick(pointer);
+    });
+
+    this.input.on('pointermove', (pointer) => {
+      if (pointer.id !== this.touchStick.pointerId) return;
+      updateTouchStick(pointer);
+    });
+    this.input.on('pointerup', (pointer) => {
+      if (pointer.id !== this.touchStick.pointerId) return;
+      resetTouchStick();
+    });
+    this.input.on('pointerupoutside', (pointer) => {
+      if (pointer.id !== this.touchStick.pointerId) return;
+      resetTouchStick();
+    });
+    this.touchUi.add([stickZone, stickRing, stickCenter, stickKnob, stickHint]);
 
     const makeTapButton = ({ x, y, label, accent, key, onTap, radius = 54 }) => {
       const bg = this.add.circle(x, y, radius, accent, 0.82)
@@ -620,10 +677,15 @@ export class GameScene extends Phaser.Scene {
       this.touchUi.add([bg, text]);
     };
 
-    makeHoldButton({ x: leftX, y: bottomY - 78, label: '↑', control: 'up' });
-    makeHoldButton({ x: leftX - 78, y: bottomY + 6, label: '←', control: 'left' });
-    makeHoldButton({ x: leftX, y: bottomY + 6, label: '↓', control: 'down' });
-    makeHoldButton({ x: leftX + 78, y: bottomY + 6, label: '→', control: 'right' });
+    makeTapButton({
+      x: topRightX,
+      y: topRightY,
+      label: 'RESET',
+      accent: 0x4466ff,
+      key: 'reset',
+      onTap: () => this.resetPlayerToTrack(),
+      radius: 42,
+    });
 
     makeTapButton({
       x: rightX,
@@ -1486,18 +1548,7 @@ export class GameScene extends Phaser.Scene {
 
     // ── R to respawn on nearest waypoint ──
     if (Phaser.Input.Keyboard.JustDown(this.rKey)) {
-      let best = 0, bestDist = Infinity;
-      WAYPOINTS.forEach((wp, i) => {
-        const d = Math.hypot(wp.x - this.player.x, wp.y - this.player.y);
-        if (d < bestDist) { bestDist = d; best = i; }
-      });
-      const wp = WAYPOINTS[best];
-      const wpNext = WAYPOINTS[(best + 1) % WP_COUNT];
-      this.player.setPosition(wp.x, wp.y);
-      this.player.body.setVelocity(0, 0);
-      const angle = Math.atan2(wpNext.y - wp.y, wpNext.x - wp.x);
-      this.player.setAngle(Phaser.Math.RadToDeg(angle) + 90);
-      this.flashScreen(0xFFFF00);
+      this.resetPlayerToTrack();
     }
 
     // ── T to cycle transformations ──
@@ -1789,6 +1840,26 @@ export class GameScene extends Phaser.Scene {
     const impulse = PLAYER_MAX_SPEED * Math.max(0.25, boost);
     this.player.body.velocity.x += Math.cos(rad) * impulse;
     this.player.body.velocity.y += Math.sin(rad) * impulse;
+    return this.getDebugState();
+  }
+
+  resetPlayerToTrack() {
+    let best = 0;
+    let bestDist = Infinity;
+    WAYPOINTS.forEach((wp, i) => {
+      const d = Math.hypot(wp.x - this.player.x, wp.y - this.player.y);
+      if (d < bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    });
+    const wp = WAYPOINTS[best];
+    const wpNext = WAYPOINTS[(best + 1) % WP_COUNT];
+    this.player.setPosition(wp.x, wp.y);
+    this.player.body.setVelocity(0, 0);
+    const angle = Math.atan2(wpNext.y - wp.y, wpNext.x - wp.x);
+    this.player.setAngle(Phaser.Math.RadToDeg(angle) + 90);
+    this.flashScreen(0xFFFF00);
     return this.getDebugState();
   }
 
